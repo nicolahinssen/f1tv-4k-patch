@@ -113,7 +113,7 @@ SMALI_FILE="$(find "${DECOMPILED}" -name 'DeviceSupportImpl.smali' -path '*/tile
 [[ -n "${SMALI_FILE}" ]] || die "DeviceSupportImpl.smali not found in decompiled output"
 ok "Found: ${SMALI_FILE#${WORKDIR}/}"
 
-info "Patching validateIsUhdSupportedDevice method..."
+info "Patching DeviceSupportImpl validators..."
 python3 - "${SMALI_FILE}" << 'PYEOF'
 import sys, re
 
@@ -121,14 +121,9 @@ smali_path = sys.argv[1]
 with open(smali_path, 'r') as f:
     content = f.read()
 
-pattern = (
-    r'\.method private final validateIsUhdSupportedDevice\('
-    r'Lcom/avs/f1/ui/tiledmediaplayer/DeviceCapabilities;\)Lkotlin/Pair;'
-    r'.*?'
-    r'\.end method'
-)
-
-replacement = """.method private final validateIsUhdSupportedDevice(Lcom/avs/f1/ui/tiledmediaplayer/DeviceCapabilities;)Lkotlin/Pair;
+# Both validators return Pair<Boolean, String> — patch to always return Pair(true, null).
+# This is the same stub used by the APKPure modded APK.
+TRUE_PAIR_STUB = """
     .locals 2
     .annotation system Ldalvik/annotation/Signature;
         value = {
@@ -142,7 +137,6 @@ replacement = """.method private final validateIsUhdSupportedDevice(Lcom/avs/f1/
         }
     .end annotation
 
-    # UHD patch: always return Pair(true, null)
     new-instance v0, Lkotlin/Pair;
 
     const/4 v1, 0x1
@@ -158,28 +152,58 @@ replacement = """.method private final validateIsUhdSupportedDevice(Lcom/avs/f1/
     return-object v0
 .end method"""
 
-new_content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
+patched = 0
 
-if count == 0:
-    print("ERROR: Could not find validateIsUhdSupportedDevice method to patch!", file=sys.stderr)
+# Patch all 4 validators to always return Pair(true, null):
+#   1. validateTmSdkSupport — ClearVR SDK secure HEVC decoder capability check
+#      (queries VideoCapabilities.areSizeAndRateSupported(3840, 2160, 50.0) on secure decoder)
+#   2. validateLowRamDeviceSupport — ActivityManager.isLowRamDevice() check
+#   3. validateApiLevelSupport — Android API level minimum check
+#   4. validateIsUhdSupportedDevice — UHD device brand/product whitelist from configPROD.json
+validators = [
+    "validateTmSdkSupport",
+    "validateLowRamDeviceSupport",
+    "validateApiLevelSupport",
+    "validateIsUhdSupportedDevice",
+]
+
+for name in validators:
+    pattern = (
+        r'\.method private final ' + name + r'\('
+        r'Lcom/avs/f1/ui/tiledmediaplayer/DeviceCapabilities;\)Lkotlin/Pair;'
+        r'.*?'
+        r'\.end method'
+    )
+    replacement = (f".method private final {name}("
+        "Lcom/avs/f1/ui/tiledmediaplayer/DeviceCapabilities;)Lkotlin/Pair;"
+        + TRUE_PAIR_STUB)
+    content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
+    if count:
+        print(f"  Patched {name} → always true")
+        patched += count
+    else:
+        print(f"  WARNING: {name} not found")
+
+if patched == 0:
+    print("ERROR: No validators were patched!", file=sys.stderr)
     sys.exit(1)
 
 with open(smali_path, 'w') as f:
-    f.write(new_content)
+    f.write(content)
 
-print(f"Patched {count} method(s)")
+print(f"Patched {patched} validator(s)")
 PYEOF
 
 [[ $? -eq 0 ]] || die "Smali patching failed"
-ok "Smali patch applied"
+ok "DeviceSupportImpl validators patched"
 
-# ─── Patch video quality button ──────────────────────────────────────────────
+# ─── Patch diagnostics preferences ──────────────────────────────────────────
 
 info "Searching for DiagnosticsPreferenceManagerImpl.smali..."
 DIAG_SMALI="$(find "${DECOMPILED}" -name 'DiagnosticsPreferenceManagerImpl.smali' -print -quit)"
 if [[ -n "${DIAG_SMALI}" ]]; then
     ok "Found: ${DIAG_SMALI#${WORKDIR}/}"
-    info "Patching isVideoQualityEnabled to always return true..."
+    info "Patching diagnostics methods to always return true..."
     python3 - "${DIAG_SMALI}" << 'PYEOF'
 import sys, re
 
@@ -187,50 +211,217 @@ smali_path = sys.argv[1]
 with open(smali_path, 'r') as f:
     content = f.read()
 
-pattern = (
-    r'\.method public isVideoQualityEnabled\(\)Z'
-    r'.*?'
-    r'\.end method'
-)
+# Methods to patch: all return boolean and should always return true
+methods_to_enable = [
+    "isVideoQualityEnabled",
+    "isScreenCaptureEnabled",
+    "isVideoStreamTypeOverlayEnabled",
+    "isPlayerTypeOverlayEnabled",
+    "isOverlayLogsEnabled",
+]
 
-replacement = """.method public isVideoQualityEnabled()Z
+total = 0
+for method in methods_to_enable:
+    pattern = (
+        rf'\.method public {re.escape(method)}\(\)Z'
+        r'.*?'
+        r'\.end method'
+    )
+
+    replacement = f""".method public {method}()Z
     .locals 1
 
-    # Quality patch: always return true
+    # Diagnostics patch: always return true
     const/4 v0, 0x1
 
     return v0
 .end method"""
 
-new_content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
+    content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
+    if count > 0:
+        print(f"  Patched {method}")
+        total += count
+    else:
+        print(f"  WARNING: {method} not found, skipping")
 
-if count == 0:
-    print("ERROR: Could not find isVideoQualityEnabled method to patch!", file=sys.stderr)
+if total == 0:
+    print("ERROR: No diagnostics methods were patched!", file=sys.stderr)
     sys.exit(1)
 
 with open(smali_path, 'w') as f:
-    f.write(new_content)
+    f.write(content)
 
-print(f"Patched isVideoQualityEnabled ({count} occurrence(s))")
+print(f"Patched {total} diagnostics method(s)")
 PYEOF
 
-    [[ $? -eq 0 ]] || die "Video quality patch failed"
-    ok "Video quality patch applied"
+    [[ $? -eq 0 ]] || die "Diagnostics patch failed"
+    ok "Diagnostics patch applied"
 else
-    warn "DiagnosticsPreferenceManagerImpl.smali not found, skipping quality patch"
+    warn "DiagnosticsPreferenceManagerImpl.smali not found, skipping diagnostics patch"
+fi
+
+# ─── Spoof device model in request header ────────────────────────────────────
+
+info "Searching for TvApplication.smali..."
+TVAPP_SMALI="$(find "${DECOMPILED}" -name 'TvApplication.smali' -path '*/avs/f1/*' -print -quit)"
+if [[ -n "${TVAPP_SMALI}" ]]; then
+    ok "Found: ${TVAPP_SMALI#${WORKDIR}/}"
+    info "Spoofing device model as Chromecast in request header..."
+    python3 - "${TVAPP_SMALI}" << 'PYEOF'
+import sys
+
+smali_path = sys.argv[1]
+with open(smali_path, 'r') as f:
+    content = f.read()
+
+# Replace Build.MODEL read with hardcoded "chromecast" string
+# Original: sget-object v1, Landroid/os/Build;->MODEL:Ljava/lang/String;
+# We replace the MODEL read + toLowerCase block with a const-string
+old = '    sget-object v1, Landroid/os/Build;->MODEL:Ljava/lang/String;'
+new = '    const-string v1, "Chromecast"'
+
+if old not in content:
+    print("ERROR: Could not find Build.MODEL in getRequestHeader!", file=sys.stderr)
+    sys.exit(1)
+
+content = content.replace(old, new, 1)
+
+with open(smali_path, 'w') as f:
+    f.write(content)
+
+print("Spoofed Build.MODEL as 'Chromecast' in request header")
+PYEOF
+
+    [[ $? -eq 0 ]] || die "Model spoof patch failed"
+    ok "Model spoof patch applied"
+else
+    warn "TvApplication.smali not found, skipping model spoof"
+fi
+
+# ─── Patch ClearVR decoder capabilities (force 4K tiled streaming) ─────────
+
+info "Searching for DecoderCapability.smali..."
+DECODER_CAP_SMALI="$(find "${DECOMPILED}" -name 'DecoderCapability.smali' -path '*/tiledmedia/*' -print -quit)"
+if [[ -n "${DECODER_CAP_SMALI}" ]]; then
+    ok "Found: ${DECODER_CAP_SMALI#${WORKDIR}/}"
+    info "Patching ClearVR decoder capability reporting..."
+    python3 - "${DECODER_CAP_SMALI}" << 'PYEOF'
+import sys
+
+smali_path = sys.argv[1]
+with open(smali_path, 'r') as f:
+    content = f.read()
+
+# In getAsCoreProtobuf(), override the values sent to the ClearVR backend.
+# The SDK probes local hardware and reports capabilities via protobuf.
+# Devices without a ClearVR quirk profile report 0 for tile slots/rows/cols,
+# causing the backend to serve a lower resolution tier (2880x1620 instead of 3840x2160).
+
+patches = [
+    # Override secureDecoderMaximumTileSlotCount: 0 → 16 (matches Oculus Go/Quest profiles)
+    (
+        '    iget v2, p0, Lcom/tiledmedia/clearvrdecoder/util/DecoderCapability;->maxNumberOfSecureHEVCSamples:I',
+        '    const/16 v2, 0x10',
+        'secureDecoderMaximumTileSlotCount → 16'
+    ),
+    # Override maxTileRows: 0 → 5 (matches Chromecast/Google TV profile)
+    (
+        '    iget v2, p0, Lcom/tiledmedia/clearvrdecoder/util/DecoderCapability;->maxTileRows:I',
+        '    const/4 v2, 0x5',
+        'maxTileRows → 5'
+    ),
+    # Override maxTileColumns: 0 → 5 (matches Chromecast/Google TV profile)
+    (
+        '    iget v2, p0, Lcom/tiledmedia/clearvrdecoder/util/DecoderCapability;->maxTileColumns:I',
+        '    const/4 v2, 0x5',
+        'maxTileColumns → 5'
+    ),
+]
+
+patched = 0
+for old, new, desc in patches:
+    if old in content:
+        content = content.replace(old, new, 1)
+        print(f"  Patched {desc}")
+        patched += 1
+    else:
+        print(f"  WARNING: Could not find pattern for {desc}, skipping")
+
+if patched == 0:
+    print("ERROR: No ClearVR capability patches applied!", file=sys.stderr)
+    sys.exit(1)
+
+with open(smali_path, 'w') as f:
+    f.write(content)
+
+print(f"Patched {patched}/3 ClearVR decoder capabilities")
+PYEOF
+
+    [[ $? -eq 0 ]] || die "ClearVR capability patch failed"
+    ok "ClearVR capability patch applied"
+else
+    warn "DecoderCapability.smali not found, skipping ClearVR patch"
+fi
+
+# ─── Disable NVIDIA post-process workaround in ClearVR ────────────────────
+
+info "Searching for Quirks.smali..."
+QUIRKS_SMALI="$(find "${DECOMPILED}" -name 'Quirks.smali' -path '*/tiledmedia/clearvrdecoder/*' -print -quit)"
+if [[ -n "${QUIRKS_SMALI}" ]]; then
+    ok "Found: ${QUIRKS_SMALI#${WORKDIR}/}"
+    info "Disabling NVIDIA no-post-process workaround..."
+    python3 - "${QUIRKS_SMALI}" << 'PYEOF'
+import sys, re
+
+smali_path = sys.argv[1]
+with open(smali_path, 'r') as f:
+    content = f.read()
+
+# Patch deviceNeedsNoPostProcessWorkaround() to always return false.
+# On NVIDIA devices this sets "no-post-process"=1 on the decoder MediaFormat,
+# which may cause ClearVR to select a lower quality tile tier.
+pattern = (
+    r'\.method public static deviceNeedsNoPostProcessWorkaround\(\)Z'
+    r'.*?'
+    r'\.end method'
+)
+
+replacement = """.method public static deviceNeedsNoPostProcessWorkaround()Z
+    .locals 1
+
+    const/4 v0, 0x0
+
+    return v0
+.end method"""
+
+content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
+
+if count == 0:
+    print("WARNING: deviceNeedsNoPostProcessWorkaround not found, skipping")
+else:
+    print(f"Patched deviceNeedsNoPostProcessWorkaround → always false")
+
+with open(smali_path, 'w') as f:
+    f.write(content)
+PYEOF
+
+    [[ $? -eq 0 ]] || die "NVIDIA workaround patch failed"
+    ok "NVIDIA workaround patch applied"
+else
+    warn "Quirks.smali not found, skipping NVIDIA workaround patch"
 fi
 
 # ─── Patch NRP blit mode to NATIVE_ANDROID_DIRECT_TO_VIEW ──────────────────
 #
 # Tiledmedia's default blit mode (AUTO_DETECT) routes decoded frames through
-# GPU tile composition via SurfaceTexture → EGL → swapBuffers. On Amlogic
-# devices (Xiaomi TV Box S, etc.) this path drops ~13% of frames.
+# GPU tile composition via SurfaceTexture → EGL → swapBuffers. This causes
+# frame drops on weaker GPUs and may fail on devices that don't support
+# intermediate resolutions during the quality ramp (e.g. 2560x1620).
 # The SDK has a built-in NATIVE_ANDROID_DIRECT_TO_VIEW mode that bypasses
 # GPU composition and outputs the decoder directly to the SurfaceView.
-# Fix: on Amlogic devices, return NATIVE_ANDROID_DIRECT_TO_VIEW.
-#      on other devices (NVIDIA Shield, etc.), use the original value.
+# Fix: always return NATIVE_ANDROID_DIRECT_TO_VIEW for all devices.
 
-info "Patching NRP blit mode to direct-to-view (Amlogic only)..."
+info "Patching NRP blit mode to direct-to-view (all devices)..."
 RENDER_CONFIG="$(find "${DECOMPILED}" -name 'RenderAPIConfig.smali' -path '*/tiledmedia/*' -print -quit 2>/dev/null || true)"
 
 if [[ -n "${RENDER_CONFIG}" && -f "${RENDER_CONFIG}" ]]; then
@@ -241,45 +432,21 @@ path = sys.argv[1]
 with open(path, 'r') as f:
     content = f.read()
 
-# Patch getNRPTextureBlitMode() to return NATIVE_ANDROID_DIRECT_TO_VIEW on Amlogic,
-# or the original configured value on other devices.
-# Original (.locals 1):
+# Patch getNRPTextureBlitMode() to always return NATIVE_ANDROID_DIRECT_TO_VIEW.
+# Original:
 #   iget-object v0, p0, ...->nrpTextureBlitMode
 #   return-object v0
 #
-# Patched (.locals 2):
-#   check Build.HARDWARE.contains("amlogic")
-#   if true -> return NATIVE_ANDROID_DIRECT_TO_VIEW
-#   else   -> return original nrpTextureBlitMode
+# Patched:
+#   return NATIVE_ANDROID_DIRECT_TO_VIEW unconditionally
 
 old = """    iget-object v0, p0, Lcom/tiledmedia/clearvrview/RenderAPIConfig;->nrpTextureBlitMode:Lcom/tiledmedia/clearvrenums/NRPTextureBlitMode;
 
-    return-object v0
-.end method
+    return-object v0"""
 
-.method public getNrpColorSpace"""
+new = """    sget-object v0, Lcom/tiledmedia/clearvrenums/NRPTextureBlitMode;->NATIVE_ANDROID_DIRECT_TO_VIEW:Lcom/tiledmedia/clearvrenums/NRPTextureBlitMode;
 
-new = """    sget-object v0, Landroid/os/Build;->HARDWARE:Ljava/lang/String;
-
-    const-string v1, "amlogic"
-
-    invoke-virtual {v0, v1}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
-
-    move-result v0
-
-    if-eqz v0, :use_default
-
-    sget-object v0, Lcom/tiledmedia/clearvrenums/NRPTextureBlitMode;->NATIVE_ANDROID_DIRECT_TO_VIEW:Lcom/tiledmedia/clearvrenums/NRPTextureBlitMode;
-
-    return-object v0
-
-    :use_default
-    iget-object v0, p0, Lcom/tiledmedia/clearvrview/RenderAPIConfig;->nrpTextureBlitMode:Lcom/tiledmedia/clearvrenums/NRPTextureBlitMode;
-
-    return-object v0
-.end method
-
-.method public getNrpColorSpace"""
+    return-object v0"""
 
 if old not in content:
     print(f"Could not find getNRPTextureBlitMode pattern in {path}", file=sys.stderr)
@@ -287,22 +454,132 @@ if old not in content:
 
 content = content.replace(old, new, 1)
 
-# Also bump .locals 1 to .locals 2 in this method (need v1 for the "amlogic" string)
-method_header = '.method public getNRPTextureBlitMode()Lcom/tiledmedia/clearvrenums/NRPTextureBlitMode;\n    .locals 1'
-method_header_new = '.method public getNRPTextureBlitMode()Lcom/tiledmedia/clearvrenums/NRPTextureBlitMode;\n    .locals 2'
-if method_header in content:
-    content = content.replace(method_header, method_header_new, 1)
-else:
-    print(f"  Warning: could not bump .locals in getNRPTextureBlitMode", file=sys.stderr)
-
 with open(path, 'w') as f:
     f.write(content)
 print(f"  Patched {path}")
 PYEOF
 
-    [[ $? -eq 0 ]] && ok "NRP direct-to-view patch applied (Amlogic only)" || warn "NRP direct-to-view patch failed"
+    [[ $? -eq 0 ]] && ok "NRP direct-to-view patch applied (all devices)" || warn "NRP direct-to-view patch failed"
 else
     warn "RenderAPIConfig.smali not found, skipping direct-to-view patch"
+fi
+
+# ─── Force 4K display detection (lifts the 1.5x resolution cap) ─────────────
+#
+# Tiledmedia caps streaming resolution at ~1.5x the display size it detects.
+# On NVIDIA Shield (and similar) the SDK reads the 1080p UI surface, so it caps
+# tiles at 2880x1620 instead of 3840x2160 — the "can only select up to
+# 2880x1620" symptom (issue #9). Force getDefaultDisplaySize() to report a
+# 3840x2160 panel so the cap allows full 2160p.
+
+info "Searching for TrueTVDisplaySizeHelper.smali..."
+TRUE_TV_HELPER="$(find "${DECOMPILED}" -name 'TrueTVDisplaySizeHelper.smali' -path '*/tiledmedia/*' -print -quit)"
+if [[ -n "${TRUE_TV_HELPER}" ]]; then
+    ok "Found: ${TRUE_TV_HELPER#${WORKDIR}/}"
+    info "Forcing display size to 3840x2160..."
+    python3 - "${TRUE_TV_HELPER}" << 'PYEOF'
+import sys, re
+
+path = sys.argv[1]
+with open(path, 'r') as f:
+    content = f.read()
+
+# Replace getDefaultDisplaySize() body with a hardcoded 3840x2160 Point.
+# 0xf00 = 3840, 0x870 = 2160. Result is also cached in trueDisplaySize.
+pattern = (
+    r'\.method private static getDefaultDisplaySize\(Landroid/content/Context;\)Landroid/graphics/Point;'
+    r'.*?'
+    r'\.end method'
+)
+replacement = """.method private static getDefaultDisplaySize(Landroid/content/Context;)Landroid/graphics/Point;
+    .locals 3
+
+    # UHD Patch: always report a 3840x2160 panel
+    new-instance v0, Landroid/graphics/Point;
+
+    const/16 v1, 0xf00
+
+    const/16 v2, 0x870
+
+    invoke-direct {v0, v1, v2}, Landroid/graphics/Point;-><init>(II)V
+
+    sput-object v0, Lcom/tiledmedia/clearvrview/TrueTVDisplaySizeHelper;->trueDisplaySize:Landroid/graphics/Point;
+
+    return-object v0
+.end method"""
+
+content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
+if count == 0:
+    print("ERROR: getDefaultDisplaySize not found", file=sys.stderr)
+    sys.exit(1)
+
+with open(path, 'w') as f:
+    f.write(content)
+print(f"Patched getDefaultDisplaySize -> 3840x2160")
+PYEOF
+
+    [[ $? -eq 0 ]] || die "4K display patch failed"
+    ok "4K display detection patch applied"
+else
+    warn "TrueTVDisplaySizeHelper.smali not found, skipping 4K display patch"
+fi
+
+# ─── HLG/HDR bypass (fallback — opt-in via F1TV_HLG_BYPASS=1) ───────────────
+#
+# F1TV only serves the 2160p tier inside the HDR (HLG) manifest; SDR is capped
+# at 1620p server-side. Devices that don't expose the EGL HLG colorspace
+# extension (e.g. NVIDIA Shield) never advertise HLG support, so the backend
+# withholds 2160p. Forcing getIsBt2020HlgExtensionSupported() to true makes the
+# SDK advertise HLG so the 2160p HDR tier is offered.
+#
+# This is a FALLBACK — only needed if the 4K display patch above isn't enough.
+# Enable with F1TV_HLG_BYPASS=1. HLG output may not render correctly on devices
+# without true HLG support, so test before relying on it.
+
+if [[ "${F1TV_HLG_BYPASS:-0}" == "1" ]]; then
+    info "F1TV_HLG_BYPASS=1 — patching HLG extension support..."
+    EGL_RENDER="$(find "${DECOMPILED}" -name 'EGLRenderTarget.smali' -path '*/tiledmedia/*' -print -quit)"
+    if [[ -n "${EGL_RENDER}" ]]; then
+        ok "Found: ${EGL_RENDER#${WORKDIR}/}"
+        python3 - "${EGL_RENDER}" << 'PYEOF'
+import sys, re
+
+path = sys.argv[1]
+with open(path, 'r') as f:
+    content = f.read()
+
+# Force getIsBt2020HlgExtensionSupported() to always return true.
+pattern = (
+    r'\.method public static getIsBt2020HlgExtensionSupported\(\)Z'
+    r'.*?'
+    r'\.end method'
+)
+replacement = """.method public static getIsBt2020HlgExtensionSupported()Z
+    .locals 1
+
+    # UHD Patch: always advertise HLG support
+    const/4 v0, 0x1
+
+    return v0
+.end method"""
+
+content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
+if count == 0:
+    print("ERROR: getIsBt2020HlgExtensionSupported not found", file=sys.stderr)
+    sys.exit(1)
+
+with open(path, 'w') as f:
+    f.write(content)
+print(f"Patched getIsBt2020HlgExtensionSupported -> true")
+PYEOF
+
+        [[ $? -eq 0 ]] || die "HLG bypass patch failed"
+        ok "HLG bypass patch applied"
+    else
+        warn "EGLRenderTarget.smali not found, skipping HLG bypass"
+    fi
+else
+    info "HLG bypass disabled (set F1TV_HLG_BYPASS=1 to enable as fallback)"
 fi
 
 # ─── Patch version name ─────────────────────────────────────────────────────
