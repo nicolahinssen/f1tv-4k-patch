@@ -215,8 +215,6 @@ with open(smali_path, 'r') as f:
 methods_to_enable = [
     "isVideoQualityEnabled",
     "isScreenCaptureEnabled",
-    "isVideoStreamTypeOverlayEnabled",
-    "isPlayerTypeOverlayEnabled",
     "isOverlayLogsEnabled",
 ]
 
